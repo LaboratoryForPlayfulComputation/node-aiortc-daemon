@@ -48,10 +48,9 @@ class RPCDispatcher(object):
     """
 
     def __init__(self, loop, write):
-        self.pc = RTCPeerConnection()
+        self.peers = {}
         self.loop = loop
         self.output = write
-        self.chan_ready = asyncio.Event()
 
     async def _raiseEvent(self, eventName, eventData):
         """
@@ -66,54 +65,81 @@ class RPCDispatcher(object):
         }
         await self.loop.run_in_executor(None, self.output.write, json.dumps(event) + '\n')
 
-    async def get_local_offer_sdp(self):
+    async def create_peer_connection(self, peerid):
+        if peerid in self.peers:
+            raise Exception("Peer already exists")
+        else:
+            self.peers[peerid] = {
+                'pc': RTCPeerConnection(),
+                'event': asyncio.Event()
+            }
+            return True
+
+    async def offer(self, peerid):
         """
         Generate an offer to open a channel.
         """
-        channel = self.pc.createDataChannel('comms')
+        pc = self.peers[peerid]['pc']
+        event = self.peers[peerid]['event']
+        channel = pc.createDataChannel('chan')
+
+        self.peers[peerid]['channel'] = channel
 
         @channel.on('open')
         async def on_open():
-            self.chan_ready.set()
-            await self._raiseEvent("channel_open", {"name": 'comms'})
+            event.set()
+            await self._raiseEvent("channel_open", {"peer": peerid})
 
         @channel.on('message')
         async def on_message(message):
             await self._raiseEvent("channel_message", {
-                "name": 'comms', "message": message})
+                "peer": peerid, "message": message})
 
-        await self.pc.setLocalDescription(await self.pc.createOffer())
-        return description_to_string(self.pc.localDescription)
+        await pc.setLocalDescription(await pc.createOffer())
+        return description_to_string(pc.localDescription)
 
-    async def complete_offer(self, answer):
+    async def complete_offer(self, answer, peerid):
         """
         Complete an offer begun with get_local_offer_sdp once an answer has
         been received, and open the connection.
         """
         answer = json2obj(answer)
-        await self.pc.setRemoteDescription(answer)
-        await self.chan_ready.wait()
+
+        pc = self.peers[peerid]['pc']
+        event = self.peers[peerid]['event']
+
+        await pc.setRemoteDescription(answer)
+        await event.wait()
         return True
 
-    async def answer(self, offer):
+    async def answer(self, offer, peerid):
         """
         Answer an SDP-encoded offer
         """
         offer = json2obj(offer)
 
-        @self.pc.on('datachannel')
+        pc = self.peers[peerid]['pc']
+        event = self.peers[peerid]['event']
+
+        @pc.on('datachannel')
         async def on_channel(channel):
 
             @channel.on('message')
             async def on_message(message):
-                await self._raiseEvent("channel_message", {"name": channel.label, "message": message})
+                await self._raiseEvent("channel_message", {"peer": peerid, "message": message})
 
-            await self._raiseEvent("channel_open", {"name": channel.label})
+            self.peers[peerid]['channel'] = channel
+            await self._raiseEvent("channel_open", {"peer": peerid})
 
-        await self.pc.setRemoteDescription(offer)
+        await pc.setRemoteDescription(offer)
 
-        await self.pc.setLocalDescription(await self.pc.createAnswer())
-        return description_to_string(self.pc.localDescription)
+        await pc.setLocalDescription(await pc.createAnswer())
+        return description_to_string(pc.localDescription)
+
+    async def send(self, message, peerid):
+        chan = self.peers[peerid]['channel']
+
+        chan.send(message)
 
 
 # This class simply requires exclusive access to write to the underlying
@@ -151,14 +177,25 @@ async def respond(dispatcher, out, rpcLine):
         kwArgs = data["kwArgs"]
     except KeyError:
         kwArgs = {}
-    resp = {
-        "type": "response",
-        "value": {
-            "id": data["id"],
-            "rpcEndpoint": data["rpcEndpoint"],
-            "value": await (getattr(dispatcher, data["rpcEndpoint"])(*args, **kwArgs)),
+
+    try:
+        resp = {
+            "type": "response",
+            "value": {
+                "id": data["id"],
+                "rpcEndpoint": data["rpcEndpoint"],
+                "value": await (getattr(dispatcher, data["rpcEndpoint"])(*args, **kwArgs)),
+            }
         }
-    }
+    except Exception as ex:
+        resp = {
+            "type": "throw",
+            "value": {
+                "id": data["id"],
+                "rpcEndpoint": data["rpcEndpoint"],
+                "value": str(ex)
+            }
+        }
     await loop.run_in_executor(None, out.write, json.dumps(resp) + '\n')
 
 
