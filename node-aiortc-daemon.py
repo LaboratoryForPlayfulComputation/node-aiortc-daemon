@@ -137,7 +137,8 @@ class RPCDispatcher(object):
         return description_to_string(pc.localDescription)
 
     async def send(self, message, peerid):
-        self.peers[peerid]['event'].wait()
+        await self.peers[peerid]['event'].wait()
+        await self._raiseEvent("message_sent", {"message": message, "to": peerid})
         chan = self.peers[peerid]['channel']
 
         chan.send(message)
